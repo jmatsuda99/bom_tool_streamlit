@@ -1,20 +1,21 @@
 
 import io
 import os
+import re
 import sqlite3
 import pandas as pd
 import streamlit as st
 from utils import normalize_columns, coerce_numeric
 
 st.set_page_config(page_title="BOM Builder", page_icon="🧩", layout="wide")
-st.title("🧩 BOM Builder – 複数行チェック（全項目表示） → BOM出力")
+st.title("🧩 BOM Builder – 複数行チェック（全項目表示） → 列を動的に除外してBOM出力")
 
 with st.sidebar:
     st.markdown("### 手順")
-    st.write("1) マスターファイルをアップロード（Excel/CSV）")
-    st.write("2) シート選択（Excelの場合）")
-    st.write("3) 列名の正規化と数値化")
-    st.write("4) **全カラム表示**の編集テーブルで複数行チェック & 数量入力")
+    st.write("1) マスターファイル（Excel/CSV）をアップロード")
+    st.write("2) シート選択（Excel）→ 列名の正規化＆数値化")
+    st.write("3) **全カラム表示**の編集テーブルで複数行チェック & 数量入力")
+    st.write("4) サイドバーの **除外カラム** で不要列を動的に指定")
     st.write("5) 選択行をBOM（CSV/Excel）として出力")
 
 uploaded = st.file_uploader("マスターファイル（Excel: .xlsx / CSV: .csv）", type=["xlsx","csv"])
@@ -73,7 +74,6 @@ qty_vals = []
 for _, r in df_page.iterrows():
     gi = int(r["__global_idx__"])
     select_vals.append(gi in st.session_state["selected_rows"])
-    # 既存Qtyがあれば、それを使う。なければ Qty 列 or 1
     if gi in st.session_state["qty_map"]:
         qty_vals.append(int(st.session_state["qty_map"][gi]))
     else:
@@ -92,6 +92,18 @@ df_page.insert(2, "QtySel", qty_vals)
 base_cols = ["__global_idx__", "Select", "QtySel"]
 other_cols = [c for c in df_page.columns if c not in base_cols]
 df_display = df_page[base_cols + other_cols]
+
+# === 列の動的除外UI（サイドバー）===
+all_columns = [c for c in df.columns]  # DBに格納された全項目
+# 既定で auto-generated っぽい列名（col, col__2 等）を除外対象に初期設定
+default_exclude = [c for c in all_columns if re.match(r"^col(__\d+)?$", c)]
+exclude_cols = st.sidebar.multiselect(
+    "📦 除外するカラム（出力BOMから除外）",
+    options=all_columns,
+    default=default_exclude,
+    help="不要な列を選ぶと、BOM出力時に除外されます（画面の編集テーブル表示には影響しません）。"
+)
+st.sidebar.caption(f"除外中: {len(exclude_cols)} 列")
 
 # データエディタ表示（全カラム見せる）
 edited = st.data_editor(
@@ -117,7 +129,8 @@ if apply_now:
         gi = int(r["__global_idx__"])
         if bool(r["Select"]):
             st.session_state["selected_rows"].add(gi)
-            st.session_state["qty_map"][gi] = int(r["QtySel"]) if not pd.isna(r["QtySel"]) else 1
+            qty_val = int(r["QtySel"]) if not pd.isna(r["QtySel"]) else 1
+            st.session_state["qty_map"][gi] = max(1, qty_val)
         else:
             if gi in st.session_state["selected_rows"]:
                 st.session_state["selected_rows"].discard(gi)
@@ -130,32 +143,35 @@ if clear_all:
     st.session_state["qty_map"] = {}
     st.experimental_rerun()
 
-# 7) 選択行の集計表示＆BOM出力
+# 7) 選択行の集計表示＆BOM出力（除外カラム適用）
 sel_indices = sorted(list(st.session_state["selected_rows"]))
 st.subheader(f"選択済み行: {len(sel_indices)} 件")
 if len(sel_indices) > 0:
     sel_df = df.iloc[sel_indices].copy()
 
     # 数量列を作成/上書き
-    qty_list = []
-    for gi in sel_indices:
-        qty_list.append(int(st.session_state["qty_map"].get(gi, 1)))
+    qty_list = [int(st.session_state["qty_map"].get(gi, 1)) for gi in sel_indices]
     sel_df["Qty"] = qty_list
 
     # 金額計算
     if "UnitPrice" in sel_df.columns:
         sel_df["Total"] = (sel_df["UnitPrice"].fillna(0).astype(float)) * (sel_df["Qty"].fillna(1).astype(float))
 
-    st.dataframe(sel_df, use_container_width=True)
+    # 除外カラムをBOM出力に反映（存在チェックの上で削除）
+    drop_cols = [c for c in exclude_cols if c in sel_df.columns]
+    bom_df = sel_df.drop(columns=drop_cols) if drop_cols else sel_df
+
+    # 画面表示
+    st.dataframe(bom_df, use_container_width=True)
+    st.caption(f"※ 除外された列: {', '.join(drop_cols) if drop_cols else 'なし'}")
 
     # ダウンロード（CSV/Excel）
-    csv_bytes = sel_df.to_csv(index=False).encode("utf-8-sig")
+    csv_bytes = bom_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("🔽 選択行をBOM（CSV）としてダウンロード", data=csv_bytes, file_name="bom_selected_rows.csv", mime="text/csv")
 
-    import io
     xbuf = io.BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
-        sel_df.to_excel(writer, index=False, sheet_name="BOM")
+        bom_df.to_excel(writer, index=False, sheet_name="BOM")
     xbuf.seek(0)
     st.download_button("🔽 選択行をBOM（Excel）としてダウンロード", data=xbuf, file_name="bom_selected_rows.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -163,4 +179,4 @@ if len(sel_indices) > 0:
 with st.expander("全体プレビュー（先頭100行）を開く"):
     st.dataframe(df.head(100), use_container_width=True)
 
-st.caption("※ 編集テーブルで全カラムを表示しています。ページを切り替えた後も「✅ 反映」を押せば選択が累積されます。")
+st.caption("※ 除外カラムはBOM出力にのみ適用されます。画面の編集テーブルには全カラムを表示したままにしています。")
